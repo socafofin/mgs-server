@@ -46,6 +46,8 @@ def get_db_connection():
     conn = psycopg2.connect(DATABASE_URL)
     
     # Configurar para retornar resultados como dicionários
+    conn.cursor_factory = psycopg2.extras.DictCursor
+    
     return conn
 
 # Função para obter timestamp atual

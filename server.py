@@ -654,61 +654,11 @@ def validate_key():
             conn.close()
         return jsonify({"success": False, "message": f"Erro ao validar chave: {str(e)}"})
 
-# Script para criar as tabelas necessárias
-def create_tables():
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Tabela de usuários - sintaxe PostgreSQL
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                username VARCHAR(50) UNIQUE NOT NULL,
-                password VARCHAR(255) NOT NULL,
-                hwid VARCHAR(255),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP,
-                expiration_date TIMESTAMP,
-                is_admin BOOLEAN DEFAULT FALSE,
-                last_login TIMESTAMP
-            )
-        ''')
-        
-        # Tabela de chaves - sintaxe PostgreSQL
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS keys (
-                id SERIAL PRIMARY KEY,
-                key_value VARCHAR(50) UNIQUE NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP,
-                expiration_date TIMESTAMP,
-                is_used BOOLEAN DEFAULT FALSE,
-                used_by VARCHAR(50),
-                used_at TIMESTAMP,
-                generated_by VARCHAR(50),
-                user_id INTEGER,
-                is_active BOOLEAN DEFAULT TRUE,
-                duration_days INTEGER DEFAULT 30,
-                is_admin_key BOOLEAN DEFAULT FALSE,
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            )
-        ''')
-        
-        conn.commit()
-        logging.info("Tabelas criadas com sucesso!")
-        
-    except Exception as error:
-        logging.error(f"Erro ao criar tabelas: {error}")
-    finally:
-        if conn is not None:
-            conn.close()
-
 # Inicialização do servidor
 if __name__ == '__main__':
-    # Criar tabelas se não existirem
-    create_tables()
+    # Logs de inicialização
+    logging.info("Servidor iniciando...")
+    logging.info(f"Porta configurada: {port}")
     
     # Iniciar o servidor
     app.run(host='0.0.0.0', port=port, debug=True) 

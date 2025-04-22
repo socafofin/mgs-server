@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
 import psycopg2
-import psycopg2.extras
+from psycopg2.extras import DictCursor
 import secrets
 import datetime
 import logging
@@ -29,17 +29,23 @@ CORS(app, resources={
     }
 })
 
-# Configuração do banco de dados
-# Você pode usar variáveis de ambiente para a string de conexão real
-# DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://user:password@localhost:5432/database")
-DATABASE_URL = "postgresql://user:password@localhost:5432/database"  # Altere para sua configuração
-
 # Porta para o servidor
 port = int(os.environ.get("PORT", 5000))
 
-# Função para obter conexão com o banco de dados
+# Função para obter conexão com o banco de dados PostgreSQL
 def get_db_connection():
+    # Obter string de conexão da variável de ambiente
+    DATABASE_URL = os.environ.get('DATABASE_URL')
+    
+    if not DATABASE_URL:
+        raise Exception("DATABASE_URL não está definida nas variáveis de ambiente")
+    
+    logging.info(f"Conectando ao banco de dados: {DATABASE_URL[:20]}...") # Log parcial para não mostrar credenciais
+    
+    # Conectar ao PostgreSQL
     conn = psycopg2.connect(DATABASE_URL)
+    
+    # Configurar para retornar resultados como dicionários
     return conn
 
 # Função para obter timestamp atual
@@ -65,12 +71,12 @@ def admin_required(f):
         
         try:
             conn = get_db_connection()
-            cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+            cur = conn.cursor()
             
             # Verificar se o usuário existe e é admin
             cur.execute("""
                 SELECT * FROM users 
-                WHERE username = %s AND password = %s AND is_admin = true
+                WHERE username = %s AND password = %s AND is_admin = TRUE
             """, (username, password))
             
             admin = cur.fetchone()
@@ -90,7 +96,7 @@ def admin_required(f):
             
         except Exception as e:
             logging.error(f"Erro na autenticação de admin: {str(e)}")
-            return jsonify({"success": False, "message": "Erro na autenticação"}), 500
+            return jsonify({"success": False, "message": f"Erro na autenticação: {str(e)}"}), 500
             
     return decorated_function
 
@@ -121,7 +127,7 @@ def login():
     
     try:
         conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur = conn.cursor()
         
         # Verificar se o usuário existe
         cur.execute("SELECT * FROM users WHERE username = %s", (username,))
@@ -203,7 +209,7 @@ def register():
     
     try:
         conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur = conn.cursor()
         
         # Verificar se o usuário já existe
         cur.execute("SELECT * FROM users WHERE username = %s", (username,))
@@ -213,7 +219,7 @@ def register():
             return jsonify({"success": False, "message": "Nome de usuário já existe"})
         
         # Verificar se a chave é válida
-        cur.execute("SELECT * FROM keys WHERE key_value = %s AND is_used = false", (key,))
+        cur.execute("SELECT * FROM keys WHERE key_value = %s AND is_used = FALSE", (key,))
         key_record = cur.fetchone()
         
         if not key_record:
@@ -236,7 +242,7 @@ def register():
         # Marcar a chave como usada
         cur.execute("""
             UPDATE keys SET 
-                is_used = true, 
+                is_used = TRUE, 
                 used_by = %s, 
                 used_at = %s, 
                 user_id = %s
@@ -249,8 +255,7 @@ def register():
         
         return jsonify({
             "success": True,
-            "message": "Registro concluído com sucesso!",
-            "expirationDate": expiration_date.strftime("%d/%m/%Y %H:%M:%S") if expiration_date else None
+            "message": "Registro concluído com sucesso!"
         })
         
     except Exception as e:
@@ -262,7 +267,7 @@ def register():
             conn.close()
         return jsonify({"success": False, "message": f"Erro no registro: {str(e)}"})
 
-# Rota para gerar novas keys (apenas admin)
+# Rota para gerar chaves (apenas admin)
 @app.route('/generate_keys', methods=['POST'])
 @admin_required
 def generate_keys():
@@ -325,7 +330,7 @@ def generate_keys():
 def get_all_keys():
     try:
         conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur = conn.cursor()
         
         # Buscar todas as chaves
         cur.execute("""
@@ -414,7 +419,7 @@ def activate_key():
         # Ativar a chave
         cur.execute("""
             UPDATE keys SET 
-                is_active = true,
+                is_active = TRUE,
                 updated_at = %s
             WHERE key_value = %s
         """, (datetime.datetime.now(), key_value))
@@ -463,7 +468,7 @@ def block_key():
         # Bloquear a chave
         cur.execute("""
             UPDATE keys SET 
-                is_active = false,
+                is_active = FALSE,
                 updated_at = %s
             WHERE key_value = %s
         """, (datetime.datetime.now(), key_value))
@@ -486,7 +491,7 @@ def block_key():
             conn.close()
         return jsonify({"success": False, "message": f"Erro ao bloquear key: {str(e)}"})
 
-# Rota para resetar o HWID de um usuário (apenas admin)
+# Rota para resetar HWID (apenas admin)
 @app.route('/reset_hwid', methods=['POST'])
 @admin_required
 def reset_hwid():
@@ -494,7 +499,7 @@ def reset_hwid():
     target_username = data.get('target_username')
     
     if not target_username:
-        return jsonify({"success": False, "message": "Usuário alvo não fornecido"}), 400
+        return jsonify({"success": False, "message": "Nome de usuário não fornecido"}), 400
     
     try:
         conn = get_db_connection()
@@ -541,7 +546,7 @@ def reset_hwid():
 def get_all_users():
     try:
         conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur = conn.cursor()
         
         # Buscar todos os usuários
         cur.execute("""
@@ -603,7 +608,7 @@ def validate_key():
     
     try:
         conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur = conn.cursor()
         
         # Verificar se a chave existe e não foi usada
         cur.execute("""
@@ -656,7 +661,7 @@ def create_tables():
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Tabela de usuários
+        # Tabela de usuários - sintaxe PostgreSQL
         cur.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
@@ -671,7 +676,7 @@ def create_tables():
             )
         ''')
         
-        # Tabela de chaves
+        # Tabela de chaves - sintaxe PostgreSQL
         cur.execute('''
             CREATE TABLE IF NOT EXISTS keys (
                 id SERIAL PRIMARY KEY,
@@ -694,7 +699,7 @@ def create_tables():
         conn.commit()
         logging.info("Tabelas criadas com sucesso!")
         
-    except (Exception, psycopg2.DatabaseError) as error:
+    except Exception as error:
         logging.error(f"Erro ao criar tabelas: {error}")
     finally:
         if conn is not None:

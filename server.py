@@ -1,14 +1,19 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
-from dotenv import load_dotenv
 import psycopg2
 import psycopg2.extras
+import secrets
 import datetime
 import logging
 import time
-
-load_dotenv()
+import random
+import string
+import json
+import hashlib
+import uuid
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
 
 # Configuração de Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,427 +29,681 @@ CORS(app, resources={
     }
 })
 
-# Configuração do PostgreSQL para Render
-DATABASE_URL = os.environ.get("DATABASE_URL")
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# Configuração do banco de dados
+# Você pode usar variáveis de ambiente para a string de conexão real
+# DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://user:password@localhost:5432/database")
+DATABASE_URL = "postgresql://user:password@localhost:5432/database"  # Altere para sua configuração
 
+# Porta para o servidor
 port = int(os.environ.get("PORT", 5000))
 
+# Função para obter conexão com o banco de dados
 def get_db_connection():
-    """Retorna uma conexão com o banco de dados PostgreSQL"""
     conn = psycopg2.connect(DATABASE_URL)
     return conn
 
-@app.before_request
-def start_timer():
-    """Inicia um temporizador para medir o tempo de resposta"""
-    request.start_time = time.time()
+# Função para obter timestamp atual
+def get_timestamp():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-@app.after_request
-def log_response_time(response):
-    """Registra o tempo que levou para responder à solicitação"""
-    duration = time.time() - getattr(request, 'start_time', time.time())
-    logging.info(f"Resposta enviada: {response.status} em {duration:.2f} segundos")
-    return response
+# Função para gerar um HWID simulado (caso o cliente não envie)
+def generate_hwid():
+    return str(uuid.uuid4())
 
-@app.before_request
-def log_request_info():
-    """Registra informações sobre a solicitação recebida"""
-    logging.info(f"Requisição recebida: {request.method} {request.url}")
-    logging.info(f"Headers: {dict(request.headers)}")
-    logging.info(f"Body: {request.get_data(as_text=True)}")
-
-@app.before_request
-def verify_content_type():
-    """Verifica se o Content-Type está correto para solicitações POST"""
-    if request.method == "POST":
-        if not request.is_json:
-            return jsonify({
-                "success": False,
-                "message": "Content-Type deve ser application/json"
-            }), 415
-
-# ==================== ROTAS ESSENCIAIS ====================
-
-@app.route('/ping', methods=['GET'])
-def ping():
-    """Rota para verificar se o servidor está online"""
-    return jsonify({"status": "ok", "message": "Servidor online!"})
-
-@app.route('/login', methods=['POST'])
-def login():
-    """Rota para autenticar um usuário"""
-    # Verificar se a requisição é JSON
-    if not request.is_json:
-        logging.warning("Requisição de login sem Content-Type application/json")
-        return jsonify({"success": False, "message": "Conteúdo deve ser enviado como JSON"}), 415
-    
-    try:
-        data = request.json
+# Middleware para autenticação de administradores
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        data = request.get_json()
         username = data.get('username')
         password = data.get('password')
         hwid = data.get('hwid')
-        vmid = data.get('vmid', '')
         
+        # Verificar se os dados necessários foram fornecidos
         if not username or not password:
-            return jsonify({"success": False, "message": "Dados incompletos"}), 400
+            return jsonify({"success": False, "message": "Credenciais de administrador necessárias"}), 401
         
-        # Verificar credenciais
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+            
+            # Verificar se o usuário existe e é admin
+            cur.execute("""
+                SELECT * FROM users 
+                WHERE username = %s AND password = %s AND is_admin = true
+            """, (username, password))
+            
+            admin = cur.fetchone()
+            
+            cur.close()
+            conn.close()
+            
+            if not admin:
+                return jsonify({"success": False, "message": "Acesso de administrador necessário"}), 403
+                
+            # Se o HWID for fornecido, verificar se corresponde
+            if hwid and admin['hwid'] != '0' and hwid != admin['hwid']:
+                return jsonify({"success": False, "message": "HWID não corresponde ao registrado"}), 403
+                
+            # Tudo ok, prosseguir com a função original
+            return f(*args, **kwargs)
+            
+        except Exception as e:
+            logging.error(f"Erro na autenticação de admin: {str(e)}")
+            return jsonify({"success": False, "message": "Erro na autenticação"}), 500
+            
+    return decorated_function
+
+# Middleware para logging
+@app.before_request
+def log_request_info():
+    logging.info(f"Requisição recebida: {request.method} {request.url}")
+    logging.info(f"Headers: {dict(request.headers)}")
+    if request.is_json:
+        logging.info(f"Body: {request.get_json()}")
+
+# Rota para verificar se o servidor está online
+@app.route('/ping', methods=['GET'])
+def ping():
+    return jsonify({"status": "ok", "message": "Servidor online!"})
+
+# Rota de login
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
+    hwid = data.get('hwid', generate_hwid())  # Usa o HWID fornecido ou gera um
+    
+    # Verificações de dados
+    if not username or not password:
+        return jsonify({"success": False, "message": "Dados incompletos"})
+    
+    try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute("SELECT * FROM users WHERE username = %s AND password = %s", [username, password])
+        
+        # Verificar se o usuário existe
+        cur.execute("SELECT * FROM users WHERE username = %s", (username,))
         user = cur.fetchone()
         
         if not user:
             cur.close()
             conn.close()
-            return jsonify({"success": False, "message": "Usuário ou senha incorretos"}), 401
+            return jsonify({"success": False, "message": "Usuário ou senha incorretos"})
         
-        # Verificar hwid OU vmid (se um dos dois bater, permite o login)
-        hwid_match = (hwid == user['hwid'])
-        vmid_match = (vmid == user['vmid'] and vmid != '')
-        hwid_is_zero = (user['hwid'] == '0')  # Caso especial para o admin
-        
-        logging.info(f"Login: HWID match: {hwid_match}, VMID match: {vmid_match}, HWID zero: {hwid_is_zero}")
-        
-        if not (hwid_match or vmid_match or hwid_is_zero):
+        # Verificar a senha
+        if user['password'] != password:  # Ideal seria usar password hashing
             cur.close()
             conn.close()
-            return jsonify({"success": False, "message": "HWID/VMID incorretos. Você não pode usar esta licença neste computador."}), 403
+            return jsonify({"success": False, "message": "Usuário ou senha incorretos"})
         
-        # Atualizar hwid/vmid se necessário (se o login foi bem-sucedido por vmid mas hwid não bate)
-        if vmid_match and not hwid_match and not hwid_is_zero:
-            try:
-                cur.execute("UPDATE users SET hwid = %s WHERE username = %s", [hwid, username])
-                conn.commit()
-                logging.info(f"HWID atualizado para o usuário {username}: {hwid}")
-            except Exception as e:
-                conn.rollback()
-                logging.error(f"Erro ao atualizar HWID: {str(e)}")
+        # Verificar HWID se não for admin
+        if not user['is_admin'] and user['hwid'] and user['hwid'] != '0' and user['hwid'] != hwid:
+            cur.close()
+            conn.close()
+            return jsonify({
+                "success": False, 
+                "message": "HWID incorreto. Você não pode usar esta licença neste computador."
+            })
         
-        # Extrair data de expiração
+        # Se o usuário não tiver HWID, atualize-o
+        if not user['hwid'] or user['hwid'] == '0':
+            cur.execute("UPDATE users SET hwid = %s WHERE username = %s", (hwid, username))
+            conn.commit()
+        
+        # Verificar expiração
+        is_expired = False
         expiration_date = user['expiration_date']
         expiration_str = None
         
         if expiration_date:
-            expiration_str = int(expiration_date.timestamp())  # Converter para timestamp UNIX
+            is_expired = datetime.datetime.now() > expiration_date
+            expiration_str = expiration_date.strftime("%d/%m/%Y %H:%M:%S")
+            
+            if is_expired and not user['is_admin']:
+                cur.close()
+                conn.close()
+                return jsonify({
+                    "success": False, 
+                    "message": "Sua licença expirou em " + expiration_str
+                })
         
-        # Fechar recursos
         cur.close()
         conn.close()
         
-        # Registrar login bem-sucedido
-        logging.info(f"Login bem-sucedido para o usuário: {username}")
-        
-        # Login bem-sucedido
         return jsonify({
             "success": True,
             "message": "Login bem-sucedido",
             "username": user['username'],
-            "isAdmin": user.get('is_admin', False),
+            "isAdmin": user['is_admin'],
             "expirationDate": expiration_str
         })
+        
     except Exception as e:
         logging.error(f"Erro no login: {str(e)}")
-        if 'conn' in locals() and 'cur' in locals():
-            cur.close()
+        if 'conn' in locals():
+            if 'cur' in locals():
+                cur.close()
             conn.close()
-        return jsonify({"success": False, "message": f"Erro de servidor: {str(e)}"}), 500
+        return jsonify({"success": False, "message": f"Erro no login: {str(e)}"})
 
+# Rota de registro
 @app.route('/register', methods=['POST'])
 def register():
-    """Rota para registrar um novo usuário"""
-    # Verificar se o request está no formato correto
-    if not request.is_json:
-        logging.warning("Requisição de registro sem Content-Type application/json")
-        return jsonify({"success": False, "message": "Conteúdo deve ser enviado como JSON (application/json)"}), 415
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
+    key = data.get('key')
+    hwid = data.get('hwid', generate_hwid())  # Usa o HWID fornecido ou gera um
+    
+    # Verificações de dados
+    if not username or not password or not key:
+        return jsonify({"success": False, "message": "Dados incompletos"})
     
     try:
-        data = request.json
-        logging.info(f"Dados de registro recebidos: {data}")
-        
-        # Extrair campos
-        username = data.get('username')
-        password = data.get('password')
-        discord_id = data.get('discord_id', '')  # ID do Discord é opcional
-        key = data.get('key')
-        hwid = data.get('hwid')
-        vmid = data.get('vmid', '')  # Valor padrão para vmid se não fornecido
-        
-        # Verificações de dados obrigatórios
-        if not username:
-            return jsonify({"success": False, "message": "Nome de usuário é obrigatório"}), 400
-        if not key:
-            return jsonify({"success": False, "message": "Chave de registro é obrigatória"}), 400
-        if not hwid:
-            return jsonify({"success": False, "message": "HWID é obrigatório"}), 400
-            
-        # Senha não precisa mais de validação de comprimento mínimo
-        if not password:
-            password = ""  # Se a senha estiver em branco, usar string vazia
-        
-        logging.info(f"Verificando chave de registro: {key}")
-        
-        # Verificação da chave
         conn = get_db_connection()
-        # Usar DictCursor para acessar os resultados como dicionário
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute("SELECT * FROM keys WHERE key_value = %s AND is_used = false", [key])
+        
+        # Verificar se o usuário já existe
+        cur.execute("SELECT * FROM users WHERE username = %s", (username,))
+        if cur.fetchone():
+            cur.close()
+            conn.close()
+            return jsonify({"success": False, "message": "Nome de usuário já existe"})
+        
+        # Verificar se a chave é válida
+        cur.execute("SELECT * FROM keys WHERE key_value = %s AND is_used = false", (key,))
         key_record = cur.fetchone()
         
         if not key_record:
             cur.close()
             conn.close()
-            logging.warning(f"Tentativa de registro com chave inválida: {key}")
-            return jsonify({"success": False, "message": "Chave inválida ou já utilizada"}), 400
+            return jsonify({"success": False, "message": "Chave inválida ou já utilizada"})
         
-        # Verificar usuário existente
-        cur.execute("SELECT * FROM users WHERE username = %s", [username])
-        if cur.fetchone():
-            cur.close()
-            conn.close()
-            logging.warning(f"Tentativa de registro com nome de usuário já existente: {username}")
-            return jsonify({"success": False, "message": "Nome de usuário já existe"}), 409
-        
-        # Obter data de expiração e configurações da chave
+        # Obter data de expiração e status admin da chave
         expiration_date = key_record['expiration_date']
-        is_admin_key = key_record['is_admin_key']
+        is_admin_key = key_record.get('is_admin_key', False)
         
-        # Registrar usuário com a data de expiração da chave
-        try:
-            # Usar campo discord_id se existir na tabela, caso contrário usar email
-            try:
-                # Tentar inserir com discord_id
-                cur.execute(
-                    "INSERT INTO users (username, password, discord_id, hwid, vmid, expiration_date, is_admin) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    [username, password, discord_id, hwid, vmid, expiration_date, is_admin_key]
-                )
-            except psycopg2.errors.UndefinedColumn:
-                # Se discord_id não existir, tentar com email
-                cur.execute(
-                    "INSERT INTO users (username, password, email, hwid, vmid, expiration_date, is_admin) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    [username, password, discord_id, hwid, vmid, expiration_date, is_admin_key]
-                )
-                
-            cur.execute("UPDATE keys SET is_used = true, used_by = %s, used_at = CURRENT_TIMESTAMP WHERE key_value = %s", 
-                        [username, key])
-            conn.commit()
-            
-            # Formatando a data para log
-            expiry_str = "sem expiração" if not expiration_date else expiration_date.strftime("%d/%m/%Y %H:%M:%S")
-            logging.info(f"Usuário {username} registrado com sucesso. Data de expiração: {expiry_str}")
-            
-            # Resposta de sucesso
-            return jsonify({
-                "success": True, 
-                "message": "Registro concluído com sucesso!",
-                "expirationDate": expiry_str if expiration_date else None
-            }), 201
-            
-        except Exception as e:
-            conn.rollback()
-            logging.error(f"Erro no banco de dados ao registrar usuário {username}: {str(e)}")
-            return jsonify({"success": False, "message": f"Erro ao registrar: {str(e)}"}), 500
-    
-    except Exception as e:
-        logging.error(f"Erro inesperado no registro: {str(e)}")
-        return jsonify({"success": False, "message": f"Erro no processamento do registro: {str(e)}"}), 500
-    
-    finally:
-        if 'cur' in locals():
-            cur.close()
-        if 'conn' in locals():
-            conn.close()
-
-@app.route('/registrar_click', methods=['POST'])
-def registrar_click():
-    """Registra cliques dos botões SPOOF e LIMPAR FIVEM"""
-    try:
-        logging.info(f"Requisição recebida em registrar_click: {request.get_data(as_text=True)}")
-        logging.info(f"Cabeçalhos: {dict(request.headers)}")
+        # Criar o usuário
+        cur.execute("""
+            INSERT INTO users (username, password, hwid, expiration_date, is_admin, created_at) 
+            VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+        """, (username, password, hwid, expiration_date, is_admin_key, datetime.datetime.now()))
         
-        if not request.is_json:
-            logging.error("A requisição não é JSON (Content-Type incorreto ou corpo inválido)")
-            return jsonify({
-                "success": False,
-                "message": "Content-Type deve ser application/json"
-            }), 415
+        user_id = cur.fetchone()[0]
         
-        data = request.get_json()
-        logging.info(f"JSON recebido: {data}")
-        tipo = data.get('tipo')  # 'spoof' ou 'fivem_clean'
-        logging.info(f"Tipo extraído: {tipo}")
+        # Marcar a chave como usada
+        cur.execute("""
+            UPDATE keys SET 
+                is_used = true, 
+                used_by = %s, 
+                used_at = %s, 
+                user_id = %s
+            WHERE key_value = %s
+        """, (username, datetime.datetime.now(), user_id, key))
         
-        if not tipo or tipo not in ['spoof', 'fivem_clean']:
-            logging.error(f"Tipo de operação inválido: {tipo}")
-            return jsonify({
-                "success": False,
-                "message": "Tipo de operação inválido"
-            }), 400
-            
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Atualiza o contador correspondente
-        if tipo == 'spoof':
-            cur.execute("""
-                UPDATE configuracoes_sistema 
-                SET total_spoofs = total_spoofs + 1, 
-                    ultima_atualizacao = CURRENT_TIMESTAMP 
-                WHERE id = 1
-                RETURNING total_spoofs
-            """)
-            novo_valor = cur.fetchone()[0]
-        else:  # fivem_clean
-            cur.execute("""
-                UPDATE configuracoes_sistema 
-                SET total_fivem_cleans = total_fivem_cleans + 1, 
-                    ultima_atualizacao = CURRENT_TIMESTAMP 
-                WHERE id = 1
-                RETURNING total_fivem_cleans
-            """)
-            novo_valor = cur.fetchone()[0]
-            
         conn.commit()
+        cur.close()
+        conn.close()
         
         return jsonify({
             "success": True,
-            "message": f"Click de {tipo} registrado com sucesso",
-            "novo_valor": novo_valor
-        }), 200
-    
+            "message": "Registro concluído com sucesso!",
+            "expirationDate": expiration_date.strftime("%d/%m/%Y %H:%M:%S") if expiration_date else None
+        })
+        
     except Exception as e:
-        logging.error(f"Erro ao registrar click: {str(e)}")
+        logging.error(f"Erro no registro: {str(e)}")
         if 'conn' in locals():
             conn.rollback()
-        return jsonify({
-            "success": False,
-            "message": f"Erro ao registrar click: {str(e)}"
-        }), 500
-    finally:
-        if 'cur' in locals():
-            cur.close()
-        if 'conn' in locals():
+            if 'cur' in locals():
+                cur.close()
             conn.close()
+        return jsonify({"success": False, "message": f"Erro no registro: {str(e)}"})
 
-@app.route('/estatisticas', methods=['GET'])
-def obter_estatisticas():
-    """Obter estatísticas de uso do sistema (total de spoofs e limpezas)"""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        
-        # Buscar as estatísticas
-        cur.execute("""
-            SELECT ultima_atualizacao, total_spoofs, total_fivem_cleans 
-            FROM configuracoes_sistema 
-            WHERE id = 1
-        """)
-        
-        resultado = cur.fetchone()
-        
-        if resultado:
-            # Formatar a data
-            data_formatada = resultado['ultima_atualizacao'].strftime("%d/%m/%Y")
-            
-            return jsonify({
-                "success": True,
-                "atualizado": data_formatada,
-                "spoofs": resultado['total_spoofs'],
-                "fivem_cleans": resultado['total_fivem_cleans']
-            }), 200
-        else:
-            return jsonify({
-                "success": False,
-                "message": "Nenhuma estatística encontrada"
-            }), 404
+# Rota para gerar novas keys (apenas admin)
+@app.route('/generate_keys', methods=['POST'])
+@admin_required
+def generate_keys():
+    data = request.get_json()
+    generated_by = data.get('username')  # Username do admin
+    quantidade = data.get('quantidade', 1)
+    duracao_dias = data.get('duracao_dias', 30)
+    is_admin_key = data.get('is_admin_key', False)
     
-    except Exception as e:
-        logging.error(f"Erro ao obter estatísticas: {str(e)}")
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Gerar as chaves
+        generated_keys = []
+        expiration_date = datetime.datetime.now() + datetime.timedelta(days=duracao_dias)
+        
+        for _ in range(quantidade):
+            # Gerar uma nova key
+            if duracao_dias == 999999:  # Key permanente
+                key = f"BRAVOS-{''.join(random.choices(string.ascii_uppercase + string.digits, k=5))}-{''.join(random.choices(string.ascii_uppercase + string.digits, k=5))}-PERM"
+            else:
+                key = f"BRAVOS-{''.join(random.choices(string.ascii_uppercase + string.digits, k=5))}-{''.join(random.choices(string.ascii_uppercase + string.digits, k=5))}-{duracao_dias}D"
+            
+            # Salvar a chave no banco
+            cur.execute("""
+                INSERT INTO keys (key_value, expiration_date, created_at, generated_by, duration_days, is_admin_key)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING key_value
+            """, (key, expiration_date, datetime.datetime.now(), generated_by, duracao_dias, is_admin_key))
+            
+            # Adicionar à lista de chaves geradas
+            generated_keys.append({
+                "key": key,
+                "expiration_date": expiration_date.strftime("%d/%m/%Y") if duracao_dias != 999999 else "Permanente"
+            })
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
         return jsonify({
-            "success": False,
-            "message": f"Erro ao obter estatísticas: {str(e)}"
-        }), 500
-    finally:
-        if 'cur' in locals():
-            cur.close()
+            "success": True,
+            "message": f"{quantidade} chave(s) gerada(s) com sucesso",
+            "keys": generated_keys
+        })
+        
+    except Exception as e:
+        logging.error(f"Erro ao gerar keys: {str(e)}")
         if 'conn' in locals():
+            conn.rollback()
+            if 'cur' in locals():
+                cur.close()
             conn.close()
+        return jsonify({"success": False, "message": f"Erro ao gerar keys: {str(e)}"})
 
-@app.route('/inicializar_estatisticas', methods=['GET'])
-def inicializar_estatisticas():
-    """Endpoint para compatibilidade com o cliente existente"""
+# Rota para obter todas as keys (apenas admin)
+@app.route('/get_all_keys', methods=['POST'])
+@admin_required
+def get_all_keys():
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         
-        # Buscar as estatísticas atuais
+        # Buscar todas as chaves
         cur.execute("""
-            SELECT total_spoofs, total_fivem_cleans 
-            FROM configuracoes_sistema 
-            WHERE id = 1
+            SELECT 
+                k.id,
+                k.key_value,
+                k.expiration_date,
+                k.created_at,
+                k.is_used,
+                k.used_by,
+                k.used_at,
+                k.generated_by,
+                k.duration_days,
+                k.is_admin_key,
+                u.hwid
+            FROM 
+                keys k
+                LEFT JOIN users u ON k.used_by = u.username
+            ORDER BY 
+                k.created_at DESC
         """)
         
-        resultado = cur.fetchone()
+        keys_data = []
+        for key in cur.fetchall():
+            # Verificar status da key
+            status = "Não Usada"
+            if key['is_used']:
+                status = "Usada"
+                if key['expiration_date'] and datetime.datetime.now() > key['expiration_date']:
+                    status = "Expirada"
+            
+            keys_data.append({
+                "id": key['id'],
+                "key": key['key_value'],
+                "expiration_date": key['expiration_date'].strftime("%d/%m/%Y") if key['expiration_date'] else "Permanente",
+                "created_at": key['created_at'].strftime("%d/%m/%Y %H:%M:%S"),
+                "is_used": key['is_used'],
+                "used_by": key['used_by'] or "Não Usada",
+                "used_at": key['used_at'].strftime("%d/%m/%Y %H:%M:%S") if key['used_at'] else None,
+                "generated_by": key['generated_by'],
+                "duration_days": key['duration_days'],
+                "is_admin_key": key['is_admin_key'],
+                "status": status,
+                "hwid": key['hwid'] if key['hwid'] else None
+            })
         
         cur.close()
         conn.close()
         
-        if resultado:
-            return jsonify({
-                "success": True,
-                "message": "Estatísticas já inicializadas",
-                "spoofs": resultado['total_spoofs'],
-                "fivem_cleans": resultado['total_fivem_cleans']
-            }), 200
-        else:
-            return jsonify({
-                "success": False,
-                "message": "Nenhuma estatística encontrada"
-            }), 404
-    
+        return jsonify({
+            "success": True,
+            "keys": keys_data
+        })
+        
     except Exception as e:
-        logging.error(f"Erro ao verificar estatísticas: {str(e)}")
+        logging.error(f"Erro ao obter keys: {str(e)}")
         if 'conn' in locals():
             if 'cur' in locals():
                 cur.close()
             conn.close()
+        return jsonify({"success": False, "message": f"Erro ao obter keys: {str(e)}"})
+
+# Rota para ativar uma key (apenas admin)
+@app.route('/activate_key', methods=['POST'])
+@admin_required
+def activate_key():
+    data = request.get_json()
+    key_value = data.get('key')
+    
+    if not key_value:
+        return jsonify({"success": False, "message": "Chave não fornecida"}), 400
+    
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Verificar se a chave existe
+        cur.execute("SELECT id FROM keys WHERE key_value = %s", (key_value,))
+        key_record = cur.fetchone()
+        
+        if not key_record:
+            cur.close()
+            conn.close()
+            return jsonify({"success": False, "message": "Chave não encontrada"}), 404
+        
+        # Ativar a chave
+        cur.execute("""
+            UPDATE keys SET 
+                is_active = true,
+                updated_at = %s
+            WHERE key_value = %s
+        """, (datetime.datetime.now(), key_value))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
         return jsonify({
-            "success": False,
-            "message": f"Erro ao verificar estatísticas: {str(e)}"
-        }), 500
+            "success": True,
+            "message": f"Chave {key_value} ativada com sucesso"
+        })
+        
+    except Exception as e:
+        logging.error(f"Erro ao ativar key: {str(e)}")
+        if 'conn' in locals():
+            conn.rollback()
+            if 'cur' in locals():
+                cur.close()
+            conn.close()
+        return jsonify({"success": False, "message": f"Erro ao ativar key: {str(e)}"})
 
-# Tratamento geral de erros
-@app.errorhandler(Exception)
-def handle_exception(e):
-    logging.error(f"Erro não tratado: {str(e)}", exc_info=True)
-    logging.error(f"Requisição que causou o erro: {request.method} {request.url}")
-    if request.is_json:
-        logging.error(f"Dados JSON recebidos: {request.get_json()}")
-    return jsonify({"success": False, "message": f"Erro interno do servidor: {str(e)}"}), 500
+# Rota para bloquear uma key (apenas admin)
+@app.route('/block_key', methods=['POST'])
+@admin_required
+def block_key():
+    data = request.get_json()
+    key_value = data.get('key')
+    
+    if not key_value:
+        return jsonify({"success": False, "message": "Chave não fornecida"}), 400
+    
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Verificar se a chave existe
+        cur.execute("SELECT id FROM keys WHERE key_value = %s", (key_value,))
+        key_record = cur.fetchone()
+        
+        if not key_record:
+            cur.close()
+            conn.close()
+            return jsonify({"success": False, "message": "Chave não encontrada"}), 404
+        
+        # Bloquear a chave
+        cur.execute("""
+            UPDATE keys SET 
+                is_active = false,
+                updated_at = %s
+            WHERE key_value = %s
+        """, (datetime.datetime.now(), key_value))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        return jsonify({
+            "success": True,
+            "message": f"Chave {key_value} bloqueada com sucesso"
+        })
+        
+    except Exception as e:
+        logging.error(f"Erro ao bloquear key: {str(e)}")
+        if 'conn' in locals():
+            conn.rollback()
+            if 'cur' in locals():
+                cur.close()
+            conn.close()
+        return jsonify({"success": False, "message": f"Erro ao bloquear key: {str(e)}"})
 
-# Rota principal
-@app.route('/')
-def index():
-    return jsonify({
-        "name": "MG Spoofer API",
-        "version": "1.0.0",
-        "status": "running",
-        "endpoints": [
-            "/ping",
-            "/login",
-            "/register",
-            "/registrar_click",
-            "/estatisticas",
-            "/inicializar_estatisticas"
-        ]
-    })
+# Rota para resetar o HWID de um usuário (apenas admin)
+@app.route('/reset_hwid', methods=['POST'])
+@admin_required
+def reset_hwid():
+    data = request.get_json()
+    target_username = data.get('target_username')
+    
+    if not target_username:
+        return jsonify({"success": False, "message": "Usuário alvo não fornecido"}), 400
+    
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Verificar se o usuário existe
+        cur.execute("SELECT id FROM users WHERE username = %s", (target_username,))
+        user = cur.fetchone()
+        
+        if not user:
+            cur.close()
+            conn.close()
+            return jsonify({"success": False, "message": "Usuário não encontrado"}), 404
+        
+        # Resetar o HWID
+        cur.execute("""
+            UPDATE users SET 
+                hwid = '0',
+                updated_at = %s
+            WHERE username = %s
+        """, (datetime.datetime.now(), target_username))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        return jsonify({
+            "success": True,
+            "message": f"HWID do usuário {target_username} resetado com sucesso"
+        })
+        
+    except Exception as e:
+        logging.error(f"Erro ao resetar HWID: {str(e)}")
+        if 'conn' in locals():
+            conn.rollback()
+            if 'cur' in locals():
+                cur.close()
+            conn.close()
+        return jsonify({"success": False, "message": f"Erro ao resetar HWID: {str(e)}"})
 
+# Rota para obter todos os usuários (apenas admin)
+@app.route('/get_all_users', methods=['POST'])
+@admin_required
+def get_all_users():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
+        # Buscar todos os usuários
+        cur.execute("""
+            SELECT 
+                id,
+                username,
+                hwid,
+                created_at,
+                expiration_date,
+                is_admin,
+                last_login
+            FROM 
+                users
+            ORDER BY 
+                created_at DESC
+        """)
+        
+        users_data = []
+        for user in cur.fetchall():
+            status = "Ativo"
+            if user['expiration_date'] and datetime.datetime.now() > user['expiration_date']:
+                status = "Expirado"
+            
+            users_data.append({
+                "id": user['id'],
+                "username": user['username'],
+                "hwid": user['hwid'] or "Não definido",
+                "created_at": user['created_at'].strftime("%d/%m/%Y %H:%M:%S") if user['created_at'] else None,
+                "expiration_date": user['expiration_date'].strftime("%d/%m/%Y") if user['expiration_date'] else "Sem expiração",
+                "is_admin": user['is_admin'],
+                "status": status,
+                "last_login": user['last_login'].strftime("%d/%m/%Y %H:%M:%S") if user['last_login'] else "Nunca"
+            })
+        
+        cur.close()
+        conn.close()
+        
+        return jsonify({
+            "success": True,
+            "users": users_data
+        })
+        
+    except Exception as e:
+        logging.error(f"Erro ao obter usuários: {str(e)}")
+        if 'conn' in locals():
+            if 'cur' in locals():
+                cur.close()
+            conn.close()
+        return jsonify({"success": False, "message": f"Erro ao obter usuários: {str(e)}"})
+
+# Rota para validar uma chave (verificar se é válida)
+@app.route('/validate_key', methods=['POST'])
+def validate_key():
+    data = request.get_json()
+    key = data.get('key')
+    
+    if not key:
+        return jsonify({"success": False, "message": "Chave não fornecida"}), 400
+    
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
+        # Verificar se a chave existe e não foi usada
+        cur.execute("""
+            SELECT 
+                key_value,
+                expiration_date,
+                is_used,
+                is_active,
+                duration_days
+            FROM 
+                keys
+            WHERE 
+                key_value = %s
+        """, (key,))
+        
+        key_record = cur.fetchone()
+        
+        cur.close()
+        conn.close()
+        
+        if not key_record:
+            return jsonify({"success": False, "message": "Chave não encontrada"}), 404
+        
+        if key_record['is_used']:
+            return jsonify({"success": False, "message": "Esta chave já foi utilizada"}), 400
+        
+        if not key_record.get('is_active', True):
+            return jsonify({"success": False, "message": "Esta chave está bloqueada"}), 400
+        
+        return jsonify({
+            "success": True,
+            "message": "Chave válida",
+            "key": key_record['key_value'],
+            "duration_days": key_record['duration_days'],
+            "expiration_date": key_record['expiration_date'].strftime("%d/%m/%Y") if key_record['expiration_date'] else "Permanente"
+        })
+        
+    except Exception as e:
+        logging.error(f"Erro ao validar chave: {str(e)}")
+        if 'conn' in locals():
+            if 'cur' in locals():
+                cur.close()
+            conn.close()
+        return jsonify({"success": False, "message": f"Erro ao validar chave: {str(e)}"})
+
+# Script para criar as tabelas necessárias
+def create_tables():
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Tabela de usuários
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(50) UNIQUE NOT NULL,
+                password VARCHAR(255) NOT NULL,
+                hwid VARCHAR(255),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP,
+                expiration_date TIMESTAMP,
+                is_admin BOOLEAN DEFAULT FALSE,
+                last_login TIMESTAMP
+            )
+        ''')
+        
+        # Tabela de chaves
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS keys (
+                id SERIAL PRIMARY KEY,
+                key_value VARCHAR(50) UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP,
+                expiration_date TIMESTAMP,
+                is_used BOOLEAN DEFAULT FALSE,
+                used_by VARCHAR(50),
+                used_at TIMESTAMP,
+                generated_by VARCHAR(50),
+                user_id INTEGER,
+                is_active BOOLEAN DEFAULT TRUE,
+                duration_days INTEGER DEFAULT 30,
+                is_admin_key BOOLEAN DEFAULT FALSE,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        ''')
+        
+        conn.commit()
+        logging.info("Tabelas criadas com sucesso!")
+        
+    except (Exception, psycopg2.DatabaseError) as error:
+        logging.error(f"Erro ao criar tabelas: {error}")
+    finally:
+        if conn is not None:
+            conn.close()
+
+# Inicialização do servidor
 if __name__ == '__main__':
-    # Modo de desenvolvimento
-    if os.environ.get('FLASK_ENV') == 'development':
-        app.run(host='0.0.0.0', port=port, debug=True)
-    else:
-        # Modo de produção
-        app.run(host='0.0.0.0', port=port) 
+    # Criar tabelas se não existirem
+    create_tables()
+    
+    # Iniciar o servidor
+    app.run(host='0.0.0.0', port=port, debug=True) 

@@ -233,6 +233,17 @@ def register():
         expiration_date = key_record['expiration_date']
         is_admin_key = key_record.get('is_admin_key', False)
         
+        # Calcular data de expiração se for NULL
+        if expiration_date is None and key_record['duration_days']:
+            expiration_date = datetime.datetime.now() + datetime.timedelta(days=key_record['duration_days'])
+            
+            # Atualizar a data de expiração na chave também
+            cur.execute("""
+                UPDATE keys SET 
+                    expiration_date = %s
+                WHERE key_value = %s
+            """, (expiration_date, key))
+        
         # Criar o usuário
         cur.execute("""
             INSERT INTO users (username, password, hwid, expiration_date, is_admin, created_at) 
